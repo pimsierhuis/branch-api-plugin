@@ -83,7 +83,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
-import edu.umd.cs.findbugs.annotations.NonNull;
 import javax.servlet.ServletException;
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
@@ -589,6 +588,10 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
         }
         long start = System.currentTimeMillis();
         listener.getLogger().format("[%tc] Starting branch indexing...%n", start);
+
+        File isFirstFile = new File(getRootDir(), "firstindexingsuccesful");
+        boolean isFirst = !isFirstFile.exists();
+
         try {
             final BranchProjectFactory<P, R> _factory = getProjectFactory();
             List<SCMSource> scmSources = getSCMSources();
@@ -639,11 +642,16 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
             for (final SCMSource source : scmSources) {
                 try {
                     source.fetch(new SCMHeadObserverImpl(source, observer, listener, _factory,
-                            new IndexingCauseFactory(), null), listener);
+                            new IndexingCauseFactory(), null, isFirst), listener);
                 } catch (IOException | InterruptedException | RuntimeException e) {
                     listener.error("[%tc] Could not fetch branches from source %s",
                             System.currentTimeMillis(), source.getId());
                     throw e;
+                }
+            }
+            if (isFirst) {
+                if (!isFirstFile.createNewFile()) {
+                    listener.getLogger().format("Error creating firstindexingsuccesful marker file%n");
                 }
             }
         } finally {
@@ -1351,7 +1359,7 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
                                                     listener,
                                                     _factory,
                                                     new EventCauseFactory(event),
-                                                    event),
+                                                    event, false),
                                             event,
                                             listener
                                     );
@@ -1385,6 +1393,7 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
         private int processHeadUpdate(SCMHeadEvent<?> event, TaskListener global, String eventDescription,
                                       String eventType, String eventOrigin, long eventTimestamp, int matchCount)
                 throws InterruptedException {
+// TODO: Is processHeadUpdate never the first to see a branch?
             Map<SCMSource, SCMHead> matches = new IdentityHashMap<>();
             Set<String> candidateNames = new HashSet<>();
             Map<SCMSource, Map<SCMHead,SCMRevision>> revisionMaps = new IdentityHashMap<>();
@@ -1590,7 +1599,7 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
                                                 listener,
                                                 _factory,
                                                 new EventCauseFactory(event),
-                                                event),
+                                                event, false),
                                         event,
                                         listener
                                 );
@@ -1681,8 +1690,8 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
                                                         listener,
                                                         _factory,
                                                         new EventCauseFactory(event),
-                                                        event
-                                                ),
+                                                        event,
+                                                        false),
                                                 event,
                                                 listener
                                         );
@@ -1944,24 +1953,31 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
         private final SCMHeadEvent<?> event;
 
         /**
-         * Constructor.
+         * TODO
+         */
+        private final boolean isFirst;
+
+        /**
          *
+         * Constructor.
          * @param source       The source that we are observing.
          * @param observer     The child observer.
          * @param listener     The task listener.
          * @param _factory     The project factory.
          * @param causeFactory A source of {@link Cause} instances to use when triggering builds.
          * @param event        The optional event to use when scoping queries.
+         * @param isFirst
          */
         public SCMHeadObserverImpl(@NonNull SCMSource source, @NonNull ChildObserver<P> observer,
                                    @NonNull TaskListener listener, @NonNull BranchProjectFactory<P, R> _factory,
-                                   @NonNull CauseFactory causeFactory, @CheckForNull SCMHeadEvent<?> event) {
+                                   @NonNull CauseFactory causeFactory, @CheckForNull SCMHeadEvent<?> event, boolean isFirst) {
             this.source = source;
             this.observer = observer;
             this.listener = listener;
             this._factory = _factory;
             this.causeFactory = causeFactory;
             this.event = event;
+            this.isFirst = isFirst;
         }
 
         /**
@@ -1974,6 +1990,8 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
             String encodedName = branch.getEncodedName();
             P project = observer.shouldUpdate(encodedName);
             try {
+
+
                 Branch origBranch = getOrigBranch(project);
                 setBranchActions(head, branch, origBranch);
                 Action[] revisionActions = getRevisionActions(revision, rawName);
@@ -2195,7 +2213,18 @@ public abstract class MultiBranchProject<P extends Job<P, R> & TopLevelItem,
         }
 
         private void doAutomaticBuilds(@NonNull SCMHead head, @NonNull SCMRevision revision, @NonNull String rawName, @NonNull P project, Action[] revisionActions, SCMRevision scmLastBuiltRevision, SCMRevision scmLastSeenRevision) {
-            if (isAutomaticBuild(head, revision, scmLastBuiltRevision, scmLastSeenRevision)) {
+            if (isFirst) {
+                try {
+                    _factory.setRevisionDuringFirstIndexingHash(project, revision);
+                } catch (IOException e) {
+                    printStackTrace(e, listener.error("Could not update revision during first indexing hash"));
+                }
+            }
+
+            SCMRevision revisionDuringFirstIndexingHash = _factory.getRevisionDuringFirstIndexing(project);
+            if (revision.equals(revisionDuringFirstIndexingHash)) {
+                listener.getLogger().format("Hardcoded not triggering automatic build for %s because branch didn't change since first indexing%n", rawName);
+            } else if (isAutomaticBuild(head, revision, scmLastBuiltRevision, scmLastSeenRevision)) {
                 scheduleBuild(
                         _factory,
                         project,
